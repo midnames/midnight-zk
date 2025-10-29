@@ -46,6 +46,7 @@ itertools = "0.14"
 dhat = "0.3"
 bellman = "0.14.0"
 serial_test = "3.2.0"
+hex = "0.4"
 
 [target.'cfg(ci_build)'.dependencies]
 midnight-curves = { path = "../curves", features = ["portable"] }
@@ -67,6 +68,14 @@ bench-internal = ["criterion", "midnight-proofs/bench-internal"]
 [[example]]
 name = "json_verification"
 path = "examples/json_verification.rs"
+
+[[example]]
+name = "json_parsing_prove"
+path = "examples/json_parsing_prove.rs"
+
+[[example]]
+name = "json_parsing_verify"
+path = "examples/json_parsing_verify.rs"
 
 [[bench]]
 name = "poseidon_cpu"
