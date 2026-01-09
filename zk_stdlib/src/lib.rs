@@ -58,11 +58,17 @@ use midnight_circuits::{
         NativeChip, NativeConfig, NativeGadget,
     },
     hash::{
-        poseidon::{PoseidonChip, PoseidonConfig, NB_POSEIDON_ADVICE_COLS, NB_POSEIDON_FIXED_COLS},
-        sha256::{Sha256Chip, Sha256Config, NB_SHA256_ADVICE_COLS, NB_SHA256_FIXED_COLS},
+        poseidon::{
+            constants::RATE, PoseidonChip, PoseidonConfig, VarLenPoseidonGadget,
+            NB_POSEIDON_ADVICE_COLS, NB_POSEIDON_FIXED_COLS,
+        },
+        sha256::{
+            Sha256Chip, Sha256Config, VarLenSha256Gadget, NB_SHA256_ADVICE_COLS,
+            NB_SHA256_FIXED_COLS,
+        },
         sha512::{Sha512Chip, Sha512Config, NB_SHA512_ADVICE_COLS, NB_SHA512_FIXED_COLS},
     },
-    instructions::{public_input::CommittedInstanceInstructions, *},
+    instructions::{hash::VarHashInstructions, public_input::CommittedInstanceInstructions, *},
     map::map_gadget::MapGadget,
     parsing::{
         self,
@@ -271,9 +277,9 @@ pub struct ZkStdLib {
     native_gadget: NG,
     core_decomposition_chip: P2RDecompositionChip<F>,
     jubjub_chip: Option<EccChip<C>>,
-    sha2_256_chip: Option<Sha256Chip<F>>,
+    sha2_256_chip: Option<(Sha256Chip<F>, VarLenSha256Gadget<F>)>,
     sha2_512_chip: Option<Sha512Chip<F>>,
-    poseidon_gadget: Option<PoseidonChip<F>>,
+    poseidon_gadget: Option<(PoseidonChip<F>, VarLenPoseidonGadget<F>)>,
     htc_gadget: Option<HashToCurveGadget<F, C, AssignedNative<F>, PoseidonChip<F>, EccChip<C>>>,
     map_gadget: Option<MapGadget<F, NG, PoseidonChip<F>>>,
     biguint_gadget: BigUintGadget<F, NG>,
@@ -312,19 +318,27 @@ impl ZkStdLib {
         let native_gadget = NativeGadget::new(core_decomposition_chip.clone(), native_chip.clone());
         let jubjub_chip = (config.jubjub_config.as_ref())
             .map(|jubjub_config| EccChip::new(jubjub_config, &native_gadget));
-        let sha2_256_chip = (config.sha2_256_config.as_ref())
+        let fixlen_sha2_256_chip = (config.sha2_256_config.as_ref())
             .map(|sha256_config| Sha256Chip::new(sha256_config, &native_gadget));
+        let sha2_256_chip = fixlen_sha2_256_chip
+            .map(|sha256_chip| (sha256_chip.clone(), VarLenSha256Gadget::new(&sha256_chip)));
         let sha2_512_chip = (config.sha2_512_config.as_ref())
             .map(|sha512_config| Sha512Chip::new(sha512_config, &native_gadget));
-        let poseidon_gadget = (config.poseidon_config.as_ref())
+        let fixlen_poseidon_gadget = (config.poseidon_config.as_ref())
             .map(|poseidon_config| PoseidonChip::new(poseidon_config, &native_chip));
-        let htc_gadget = (jubjub_chip.as_ref())
-            .zip(poseidon_gadget.as_ref())
-            .map(|(ecc_chip, poseidon_gadget)| HashToCurveGadget::new(poseidon_gadget, ecc_chip));
+        let poseidon_gadget = fixlen_poseidon_gadget.map(|poseidon_chip| {
+            (
+                poseidon_chip.clone(),
+                VarLenPoseidonGadget::new(&poseidon_chip, &native_gadget),
+            )
+        });
+        let htc_gadget = (jubjub_chip.as_ref()).zip(poseidon_gadget.as_ref()).map(
+            |(ecc_chip, poseidon_gadget)| HashToCurveGadget::new(&poseidon_gadget.0, ecc_chip),
+        );
         let biguint_gadget = BigUintGadget::new(&native_gadget);
         let map_gadget = poseidon_gadget
             .as_ref()
-            .map(|poseidon_gadget| MapGadget::new(&native_gadget, poseidon_gadget));
+            .map(|poseidon_gadget| MapGadget::new(&native_gadget, &poseidon_gadget.0));
         let secp256k1_scalar_chip = (config.secp256k1_scalar_config.as_ref())
             .map(|scalar_config| FieldChip::new(scalar_config, &native_gadget));
         let secp256k1_curve_chip = (config.secp256k1_config.as_ref())
@@ -696,7 +710,22 @@ impl ZkStdLib {
         self.poseidon_gadget
             .as_ref()
             .unwrap_or_else(|| panic!("ZkStdLibArch must enable poseidon"))
+            .0
             .hash(layouter, input)
+    }
+
+    /// The analogue of the `poseidon` function, but supports variable-length
+    /// inputs (up to length `MAX_LEN`).
+    pub fn poseidon_varlen<const MAX_LEN: usize>(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        input: &AssignedVector<F, AssignedNative<F>, MAX_LEN, RATE>,
+    ) -> Result<AssignedNative<F>, Error> {
+        self.poseidon_gadget
+            .as_ref()
+            .unwrap_or_else(|| panic!("ZkStdLibArch must enable poseidon"))
+            .1
+            .varhash(layouter, input)
     }
 
     /// Hashes a slice of assigned values into `(x, y)` coordinates which are
@@ -740,7 +769,23 @@ impl ZkStdLib {
         self.sha2_256_chip
             .as_ref()
             .expect("ZkStdLibArch must enable sha256")
+            .0
             .hash(layouter, input)
+    }
+
+    /// The analogue of the `sha2_256` function, but supports variable-length
+    /// inputs (up to length `MAX_LEN`).
+    pub fn sha256_varlen<const MAX_LEN: usize>(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        input: &AssignedVector<F, AssignedByte<F>, MAX_LEN, 64>,
+    ) -> Result<[AssignedByte<F>; 32], Error> {
+        *self.used_sha2_256.borrow_mut() = true;
+        self.sha2_256_chip
+            .as_ref()
+            .expect("ZkStdLibArch must enable sha256")
+            .1
+            .varhash(layouter, input)
     }
 
     /// Sha2_512 hash.
@@ -1653,7 +1698,7 @@ impl<R: Relation> Circuit<F> for MidnightCircuit<'_, R> {
 
         if let Some(sha256_chip) = zk_std_lib.sha2_256_chip {
             if *zk_std_lib.used_sha2_256.borrow() {
-                sha256_chip.load(&mut layouter)?;
+                sha256_chip.0.load(&mut layouter)?;
             }
         }
 
