@@ -110,6 +110,31 @@ pub enum StdLibParser {
     ///   - `"x"` -> 5
     ///   - `"y"` -> 6
     Jwt,
+
+    /// # ASN.1 DER OCTET STRING with length parsing
+    /// 
+    /// ## Structure
+    ///
+    /// The parser matches:
+    /// 1. Fixed prefix: `0606678108010101a0818f` (11 bytes)
+    /// 2. OCTET STRING tag: `04`
+    /// 3. Length encoding (one of):
+    ///    - Short form: 
+    ///        `0x00` - `0x7F` (1 byte, value is length)
+    ///    - Long form: 
+    ///        `0x81`: 1 byte follows
+    ///        `0x82`: 2 bytes follow
+    ///        `0x83`: 3 bytes follow
+    ///        `0x84`: 4 bytes follow
+    ///
+    /// ## Output Behaviour
+    ///
+    /// The length value bytes are marked with marker `1`.
+    /// For example, with input ending in `04 81 8c`:
+    /// - `04` (tag) → marker 0
+    /// - `81` (length indicator) → marker 0
+    /// - `8c` (length value = 140) → marker 1
+    Asn1OctetStringLength,
 }
 
 #[cfg(test)]
@@ -134,11 +159,18 @@ type ParsingLibrary = FxHashMap<StdLibParser, Automaton>;
 /// components. When serialization is disabled, the automaton will be computed
 /// using the second argument.
 fn spec_library_data() -> LibraryData {
-    &[(
-        StdLibParser::Jwt,
-        &spec_jwt as &'static dyn Fn() -> Regex,
-        include_bytes!("automaton_cache/Jwt") as &'static [u8],
-    )]
+    &[
+        (
+            StdLibParser::Jwt,
+            &spec_jwt as &'static dyn Fn() -> Regex,
+            include_bytes!("automaton_cache/Jwt") as &'static [u8],
+        ),
+        (
+            StdLibParser::Asn1OctetStringLength,
+            &spec_asn1_octet_string_length as &'static dyn Fn() -> Regex,
+            include_bytes!("automaton_cache/Asn1OctetStringLength") as &'static [u8],
+        ),
+    ]
 }
 
 /// All automata that can be used as a parsing basis in the standard library.
@@ -278,6 +310,71 @@ fn spec_jwt() -> Regex {
         ],
         "}",
     )
+}
+
+/// Regex formalising the spec of `StdLibParser::Asn1OctetStringLength`.
+///
+/// Parses arbitrary bytes followed by a fixed prefix, ASN.1 DER OCTET STRING
+/// tag, and length encoding. Can match the pattern anywhere in the input.
+///
+/// **Markers:**
+/// - `0` = skipped bytes, prefix (except last byte)
+/// - `3` = last byte of prefix (0x8f) - identifies pattern location
+/// - `4` = OCTET STRING tag (0x04)
+/// - `2` = length encoding indicator (0x81, 0x82, etc.) for long form
+/// - `1` = length value bytes
+fn spec_asn1_octet_string_length() -> Regex {
+    // Skip bytes until we find "06 06" (which starts our target prefix)
+    // Allow: any non-0x06 byte, OR 0x06 followed by non-0x06
+    let skip_unit = Regex::union([
+        Regex::byte_not_from([0x06u8]),
+        Regex::byte_from([0x06u8]).terminated(Regex::byte_not_from([0x06u8])),
+    ]);
+    let skip = skip_unit.list();
+
+    // Fixed prefix bytes: 0606678108010101a0818f
+    // Mark the last byte (0x8f) with marker 3 to identify the pattern
+    let prefix = Regex::cat([
+        Regex::byte_from([0x06u8]), // OID tag
+        Regex::byte_from([0x06u8]), // length 6
+        Regex::byte_from([0x67u8]),
+        Regex::byte_from([0x81u8]),
+        Regex::byte_from([0x08u8]),
+        Regex::byte_from([0x01u8]),
+        Regex::byte_from([0x01u8]),
+        Regex::byte_from([0x01u8]),
+        Regex::byte_from([0xa0u8]), // context tag
+        Regex::byte_from([0x81u8]),
+        Regex::byte_from([0x8fu8]).mark(&|_| Some(3)), // pattern
+    ]);
+
+    // OCTET STRING tag - (4)
+    let tag = Regex::byte_from([0x04u8]).mark(&|_| Some(4));
+
+    // Length encoding variants:
+    // - Short form: single byte 0x00-0x7F is the length (1)
+    // - Long form: indicator byte (2) followed by length bytes (1)
+    let short_form = Regex::byte_from(0x00u8..=0x7Fu8).mark(&|_| Some(1));
+    let long_1 = Regex::byte_from([0x81u8])
+        .mark(&|_| Some(2))
+        .terminated(Regex::any_byte().mark(&|_| Some(1)));
+    let long_2 = Regex::byte_from([0x82u8])
+        .mark(&|_| Some(2))
+        .terminated(Regex::any_byte().mark(&|_| Some(1)).repeat(2));
+    let long_3 = Regex::byte_from([0x83u8])
+        .mark(&|_| Some(2))
+        .terminated(Regex::any_byte().mark(&|_| Some(1)).repeat(3));
+    let long_4 = Regex::byte_from([0x84u8])
+        .mark(&|_| Some(2))
+        .terminated(Regex::any_byte().mark(&|_| Some(1)).repeat(4));
+
+    // Consume remaining bytes after length encoding
+    let tail = Regex::any_byte().list();
+
+    skip.terminated(prefix)
+        .terminated(tag)
+        .terminated(Regex::union([short_form, long_1, long_2, long_3, long_4]))
+        .terminated(tail)
 }
 
 #[cfg(test)]
