@@ -1,5 +1,8 @@
 # Midnight ZK
 
+> [!NOTE]
+> This is a fork of the [midnight-zk](https://github.com/midnightntwrk/midnight-zk) repo. Used for exporting some functions, and playing around with the ASN parser.
+
 This repository implements the proof system used in **Midnight**, along with tooling for building zero-knowledge circuits.
 
 ## Repository Structure
